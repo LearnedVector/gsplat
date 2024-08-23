@@ -28,6 +28,7 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.util.lib_bilagrid import BilateralGrid, slice
 
 
 @dataclass
@@ -137,6 +138,11 @@ class Config:
     tb_save_image: bool = False
 
     lpips_net: Literal["vgg", "alex"] = "alex"
+
+    # Enable exposure optimization. (experimental)
+    exp_opt: bool = False
+    # Weight for total variation loss
+    exp_tv_lambda: float = 10.0
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -389,6 +395,18 @@ class Runner:
                 mode="training",
             )
 
+        self.exp_optimizers = []
+        if cfg.exp_opt:
+            self.exp_grids = BilateralGrid(len(self.trainset)).to(self.device)
+            self.exp_optimizers = [
+                torch.optim.Adam(
+                    self.exp_grids.parameters(),
+                    lr=0.001 * math.sqrt(cfg.batch_size),
+                    betas=[0.9, 0.99],
+                    eps=1e-15,
+                ),
+            ]
+
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -468,6 +486,12 @@ class Runner:
                     self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
+        if cfg.exp_opt:
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.exp_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+                )
+            )
 
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
@@ -538,6 +562,18 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
+            if cfg.exp_opt:
+                grid_x, grid_y = torch.meshgrid(
+                    torch.arange(width, device="cuda").float(),
+                    torch.arange(height, device="cuda").float(),
+                    indexing="xy",
+                )
+                pix_xy = torch.stack([grid_x, grid_y], dim=-1)
+                pix_xy = pix_xy.reshape(1, height, width, 2) + 0.5
+                pix_xy[..., 0] /= width
+                pix_xy[..., 1] /= height
+                colors = slice(self.exp_grids, pix_xy, colors, image_ids)["rgb"]
+
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -585,9 +621,13 @@ class Runner:
                     + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
                 )
 
+            if cfg.exp_opt:
+                tvloss = self.exp_grids.tv_loss()
+                loss += cfg.exp_tv_lambda * tvloss
+
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -595,15 +635,6 @@ class Runner:
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
                 desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
-
-            # write images (gt and render)
-            # if world_rank == 0 and step % 800 == 0:
-            #     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-            #     canvas = canvas.reshape(-1, *canvas.shape[2:])
-            #     imageio.imwrite(
-            #         f"{self.render_dir}/train_rank{self.world_rank}.png",
-            #         (canvas * 255).astype(np.uint8),
-            #     )
 
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -614,6 +645,8 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                if cfg.exp_opt:
+                    self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
@@ -693,6 +726,9 @@ class Runner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.app_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.exp_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
